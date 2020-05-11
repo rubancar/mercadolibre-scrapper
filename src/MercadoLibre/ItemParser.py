@@ -1,17 +1,19 @@
 import threading
 import logging
 
-
 from ..lib.Services import get_soup_from_url, clean_string
 
 
 def split_status_amount(text):
     splitted_text = text.split(' - ')
     status = None
-    amount = None
+    amount = 0
     if len(splitted_text) > 1:
-        status, amount = splitted_text
-        amount = amount.split(' ')[0]
+        status, n_vendidos = splitted_text
+        # example: 9 Vendidos
+        parsed_text = n_vendidos.split(' ')
+        if len(parsed_text) == 2:
+            amount = int(parsed_text[0])
     else:
         status = splitted_text[0]
     return (status, amount)
@@ -51,6 +53,20 @@ def parse_description(description_ele):
         return ""
 
 
+'''
+The following conditions determines if an item is stored to ElasticSearch or not
+Price < $25 & Sales > 25U
+Price >= $25 & Sales > 50U 
+'''
+
+
+def is_product_interesting(price, sales):
+    if (price < 25 and sales > 25) or (price >= 25 and sales > 50):
+        return True
+    else:
+        return False
+
+
 class ItemParser(threading.Thread):
     def __init__(self, q, result):
         threading.Thread.__init__(self)
@@ -62,12 +78,19 @@ class ItemParser(threading.Thread):
             item_work = self.q.get()  # fetch a new item from the queue
             full_item_info = {}
             try:
-                logging.info("Requested work... %i" % item_work[0])
+                logging.debug("Requested work... %i" % item_work[0])
                 item_soup = get_soup_from_url(item_work[1]['link'])
                 # extract item info
                 item_info = item_soup.select("#short-desc > div")[0]
                 item_name = item_info.select(".item-title__primary")[0].contents[0]
-                item_price = item_info.select(".price-tag-fraction")[0].contents[0]
+                # calculate item price
+                item_price_fraction = clean_string(item_info.select(".price-tag-fraction")[0].contents[0])
+                item_price_fraction = item_price_fraction.replace(".", "")  # 2.000 is converted to 2000
+                item_price_cents = item_info.select(".price-tag-cents")
+                if len(item_price_cents) == 1: item_price_cents = clean_string(item_price_cents[0].contents[0])
+                else: item_price_cents = '00'
+                item_price = float(item_price_fraction + '.' + item_price_cents)
+
                 item_status_amount = item_info.select(".item-conditions")[0].contents[0]
                 item_status_amount = clean_string(item_status_amount)
                 extra_data = split_status_amount(item_status_amount)
@@ -91,8 +114,8 @@ class ItemParser(threading.Thread):
                 parent_url = item_soup.select("#productInfo > input:nth-child(2)")[0]['value']
 
                 full_item_info['item_name'] = clean_string(item_name)
-                full_item_info['item_price'] = clean_string(item_price)
-                full_item_info['sold_so_far'] = extra_data[1] if extra_data[0] else 0
+                full_item_info['item_price'] = item_price
+                full_item_info['sold_so_far'] = extra_data[1]
                 full_item_info['status'] = extra_data[0]
                 full_item_info['location'] = location
                 full_item_info['specs'] = item_specs_list
@@ -100,10 +123,18 @@ class ItemParser(threading.Thread):
                 full_item_info['id'] = item_id
                 full_item_info['parent_url'] = parent_url
                 full_item_info['original_url'] = item_work[1]['link']
-                logging.info("Full item info %s: ", full_item_info)
+                # the following values are added later in the process
+                # item['subsection_name']
+                # item['section_name']
+                logging.debug("Full item info %s: ", full_item_info)
 
-                self.result[item_work[0]] = full_item_info
-            except IndexError as err:
+                # if product match the conditions add it
+                if is_product_interesting(item_price, extra_data[1]):
+                    self.result[item_work[0]] = full_item_info
+                # otherwise just skipped
+                else:
+                    self.result[item_work[0]] = None
+            except Exception as err:
                 logging.error('Error with URL: %s, error: %s', item_work[1]['link'], err)
                 self.result[item_work[0]] = None
             self.q.task_done()

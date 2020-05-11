@@ -1,5 +1,7 @@
 .env
 *.iml
+*.pyc
+
 scrapped_sites.db
 
 .idea

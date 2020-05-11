@@ -40,8 +40,10 @@ def get_all_urls_one_by_one():
     query_count = 'select count(*) as total from site_subsections'
     connection.execute(query_count)
     total_rows = connection.fetchone()[0]
-    logging.info("Total number of rows for fetching: %i", total_rows)
-    query_select = 'select * from site_subsections'
+    logging.debug("Total number of rows for fetching: %i", total_rows)
+    query_select = 'select sub.id, sub.site_section_id, sub.name, sub.url, s.name as section_name' \
+                   ' from site_subsections sub ' \
+                   ' left join site_sections s on s.id = sub.site_section_id'
     connection.execute(query_select)
     for i in range(total_rows):
         row = connection.fetchone()

@@ -13,14 +13,9 @@ from src.lib.db.sqlite import query_write, query_read, get_all_urls_one_by_one
 from src.lib.db.elasticsearch import insert_data, prepare_payload
 
 
-# insert element in elasticsearch
-# res_elastic = elastic.index(index="mercadolibre-items", id=item_id, body=full_item_info)
-# logging.info("Element inserted into elastic search %s", res_elastic)
-
-# This function extract the categories from MercadoLibre main page
+# This function extract the categories from Mercado Libre main page
 def mercado_libre_extract_categories(doc):
     categories_url_dict = {}
-    print('Starting categories extraction from main page...')
     categories_section = doc.find('section', class_='categories')
     categories_list = categories_section.find_all('a', class_='category')
     # children from category list comes in tuple, extract each category link and name
@@ -30,15 +25,13 @@ def mercado_libre_extract_categories(doc):
             category_url = category['href']
             categories_url_dict[name] = category_url
         except (IndexError, KeyError) as err:
-            print('Error while parsing category (Error type):', err)
-            print(category)
-    print('Categories extraction finished')
+            logging.error('Error while parsing category %s, category: %s', err, category)
     return categories_url_dict
 
 
 def mercado_libre_extract_subcategories(doc, name):
     subcategories_dict = {}
-    print('Starting categories extraction from sub-section ' + name + " ...")
+    logging.debug('Starting categories extraction from sub-section %s ...', name)
     sub_categories = doc.select("#root-app > .categories > section > div > div:nth-child(2) > div > div "
                                 "> div.group > div.categories__wrapper")
     for subcategory in sub_categories:
@@ -48,26 +41,25 @@ def mercado_libre_extract_subcategories(doc, name):
             sub_title = sub_cat_title.contents[0]
             sub_url = sub_cat_title['href']
             subcategories_dict[sub_title] = sub_url
-            # along with the subcategory we have a list of urls
-            sub_list = subcategory.ul.children
-            for item in sub_list:
-                _link = item.a
-                _sub_title = _link.contents[0]
-                _sub_title_url = _link['href']
-                subcategories_dict[_sub_title] = _sub_title_url
         except (IndexError, KeyError) as err:
             print('Error while parsing subcategory (Error type):', err)
             print(subcategory)
-    print('Finished')
     return subcategories_dict
 
 
-def process_page_items(doc):
-    # set up the queue to hold all the urls
-    q = Queue(maxsize=0)
-    # TODO: get general information from the aside element as total of results
-    items = doc.select("#root-app > div#ml-main > div#inner-main > section > ol > li > div.rowItem > "
-                       "div.item__info-container > div.item__info > h2 > a")
+elements_processed_so_far = 0
+elements_pushed_to_elasticsearch_so_far = 0
+
+def process_page_items(doc, subsection_name, section_name):
+    global elements_processed_so_far, elements_pushed_to_elasticsearch_so_far
+    q = Queue(maxsize=0)  # set up the queue to hold all the urls
+    # if the page is ordered as a list: https://listado.mercadolibre.com.ec/acc-motos-cuatrimotos/
+    items = doc.select("div.item__info > h2 > a")
+    if len(items) == 0:
+        logging.debug("Applying search type V2")
+        # if the page is ordered as a list of images:
+        # https://computacion.mercadolibre.com.ec/discos-duros-y-removibles/
+        items = doc.select("a.item__info-link")
     # Use many threads (50 max, or one for each url)
     num_threads = min(50, len(items))
     # Populating Queue with tasks
@@ -76,46 +68,49 @@ def process_page_items(doc):
         item = items[i]
         item_link = item['href']
         item_name = item.span.contents[0]
-        # add the index and item information
-        q.put((i, {'name': item_name, 'link': item_link}))
+        q.put((i, {'name': item_name, 'link': item_link}))  # add the index and item information
 
-    logging.info("Starting workers")
+    logging.debug("Starting workers")
     for i in range(num_threads):
         worker = ItemParser(q, results)
         worker.start()
 
     q.join()
-    payload_to_elasticsearch = prepare_payload(results)
+    elements_processed_so_far += len(results)
+    payload_to_elasticsearch = prepare_payload(results, subsection_name, section_name)
+    elements_pushed_to_elasticsearch_so_far += len(payload_to_elasticsearch)
     insert_data(payload_to_elasticsearch)
+    logging.info("Elements processed so far: %i, Elements pushed to ElasticSearch: %i",
+                 elements_processed_so_far, elements_pushed_to_elasticsearch_so_far)
 
 
-def get_elements_in_page(doc, subsection_url):
+def get_elements_in_page(doc, subsection_url, subsection_name, section_name):
     try:
         # get quantity of elements
         quantity_of_items = doc.select(".quantity-results")[0].contents[0]
         # Mercado libre uses dot(.) as hundreds separator, so remove it
         quantity_of_items = clean_string(quantity_of_items).split(" ")[0].replace(".", "")
-        logging.info("Total number of items to lookup through: %s" % quantity_of_items)
+        logging.debug("Total number of items to lookup through: %s" % quantity_of_items)
         # 50 are the total number of items per page
-        number_of_pages = ceil(int(quantity_of_items) / 50)
-        logging.info("Total number of pages to lookup through: %s" % number_of_pages)
-        process_page_items(doc)
+        number_of_pages = int(ceil(int(quantity_of_items) / 50))
+        logging.debug("Total number of pages to lookup through: %s" % number_of_pages)
+        process_page_items(doc, subsection_name, section_name)
     except Exception as err:
-        logging.error("Error processing main page elements: %s", err)
+        logging.error("Error processing 1st page of elements: %s, Error message: %s", subsection_url, err)
         return
     for i in range(1, number_of_pages, 1):
         try:
             item_from = (50*i) + 1
-            if i == number_of_pages-1: logging.info("Processing items %i to %s", item_from, quantity_of_items)
-            else: logging.info("Processing items %i to %i", item_from, item_from+49)
+            if i == number_of_pages-1: logging.debug("Processing items %i to %s", item_from, quantity_of_items)
+            else: logging.debug("Processing items %i to %i", item_from, item_from+49)
             # Mercado Libre pagination format: https://listado.mercadolibre.com.ec/acc-motos-cuatrimotos/_Desde_51
             item_from_text = "_Desde_" + str(item_from)
             next_url = subsection_url + item_from_text
-            logging.info("Next URL to process: %s", next_url)
+            logging.debug("Next URL to process: %s", next_url)
             next_subsection_page = requests.get(next_url)
             next_subsection_soup = BeautifulSoup(next_subsection_page.content, 'html.parser')
             # preprocessing next message
-            process_page_items(next_subsection_soup)
+            process_page_items(next_subsection_soup, subsection_name, section_name)
         except Exception as err:
             logging.error("Error processing next page: %s", err)
             continue
@@ -123,7 +118,7 @@ def get_elements_in_page(doc, subsection_url):
 
 def main():
     logging.basicConfig(level=logging.INFO)
-    url_test = "https://listado.mercadolibre.com.ec/accesorios-motos-cascos/"
+    logging.info('Starting Mercado Libre processing')
     err, sites = query_read('select * from sites', '')
     if err is not None:
         logging.error('There was an error with DB initialization %s', sites[0])
@@ -133,7 +128,7 @@ def main():
     # site structure => (id integer, name text, url text, n_visits integer)
     site_id, _, site_url, _ = sites[0]
 
-    logging.info('Site to be fetched %s', site_url)
+    logging.debug('Site to be fetched %s', site_url)
     # request site
     page = requests.get(site_url)
     # convert site in a BeautifulSoup
@@ -149,12 +144,12 @@ def main():
             err, category_in_db = query_read('select * from site_sections where name = ?', [category_name])
             # if category doesn't exists in DB, save the new one
             if len(category_in_db) == 0:
-                logging.info('New category found, Name:%s, URL:%s', category_name, category_url)
+                logging.debug('New category found, Name:%s, URL:%s', category_name, category_url)
                 # site_id integer, name text, url text, n_visits integer, total_elements integer, so_far_visit integer
                 query_write('insert into site_sections (site_id, name, url, n_visits, total_elements, so_far_visit) '
                             'values (?,?,?,?,?,?)', [site_id, category_name, category_url, 0, 0, 0])
             else:
-                logging.info('Category already in DB, INFO %s', category_in_db)
+                logging.debug('Category already in DB, INFO %s', category_in_db)
 
         except TypeError as err:
             logging.error("Error in the following subcategory %s: %s", category_name, category_url)
@@ -174,25 +169,26 @@ def main():
                                                     [sub_category_full_name])
                 # if category doesn't exists in DB, save the new one
                 if len(subcategory_in_db) == 0:
-                    logging.info('New subcategory found, Name:%s, URL:%s', subcat_name, subcat_url)
+                    logging.debug('New subcategory found, Name:%s, URL:%s', subcat_name, subcat_url)
                     # site_section_id integer, name text, url text, n_visits integer, total_elements integer, so_far_visit integer
                     query_write(
                         'insert into site_subsections (site_section_id, name, url, n_visits, total_elements, so_far_visit) '
                         'values (?,?,?,?,?,?)', [c_id, sub_category_full_name, subcat_url, 0, 0, 0])
                 else:
-                    logging.info('Subcategory already in DB %s', subcat_name)
+                    logging.debug('Subcategory already in DB %s', subcat_name)
             except TypeError as err:
                 logging.error("Error in the following subcategory %s: %s", subcat_name, subcat_url)
 
     # get_all_rows_one_by_one returns a generator function
     urls_to_start_fetching = get_all_urls_one_by_one()
+    # urls_to_start_fetching = ["https://computacion.mercadolibre.com.ec/discos-duros-y-removibles/"]
     for record in urls_to_start_fetching:
-        logging.info("URL to fetch data %s", record)
-        # id, site_section_id, name, url , n_visits , total_elements , so_far_visit
-        subsection_id, section_id, subsection_name, subsection_url, n_visits, _, so_far_visits = record
+        logging.debug("URL to fetch data %s", record)
+        # id, site_section_id, name, url, section_name
+        subsection_id, section_id, subsection_name, subsection_url, section_name = record
         subsection_page = requests.get(subsection_url)
         subsection_soup = BeautifulSoup(subsection_page.content, 'html.parser')
-        get_elements_in_page(subsection_soup, subsection_url)
+        get_elements_in_page(subsection_soup, subsection_url, subsection_name, section_name)
 
 
 if __name__ == '__main__':
